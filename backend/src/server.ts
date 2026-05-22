@@ -32,7 +32,8 @@ await app.register(cors, {
       "http://127.0.0.1:5174",
       "http://127.0.0.1:5175"
     ]);
-    callback(null, allowedOrigins.has(origin));
+    const isNetlifyFrontend = /^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin);
+    callback(null, allowedOrigins.has(origin) || isNetlifyFrontend);
   },
   credentials: true
 });
