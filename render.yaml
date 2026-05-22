@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: arena-epv-api
+    env: node
+    plan: free
+    buildCommand: npm install && npm --workspace backend run build && npx prisma generate --schema backend/prisma/schema.prisma
+    startCommand: npm --workspace backend run start
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: PAYMENTS_MODE
+        value: mock
+      - key: FRONTEND_URL
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true

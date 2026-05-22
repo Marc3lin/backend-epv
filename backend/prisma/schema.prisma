@@ -1,0 +1,170 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CLIENT
+  RECEPTION
+  ADMIN
+}
+
+enum CourtType {
+  SAND_VOLLEY
+  INDOOR_VOLLEY
+  FUTSAL
+  MULTI
+}
+
+enum ReservationStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  CANCELLED
+  REFUNDED_MANUAL
+  FAILED
+}
+
+enum WhatsAppEvent {
+  PENDING_PAYMENT
+  PAYMENT_CONFIRMED
+  CANCELLATION
+  REMINDER
+}
+
+model User {
+  id             String        @id @default(cuid())
+  email          String        @unique
+  passwordHash   String
+  fullName       String
+  role           Role          @default(CLIENT)
+  mustChangePass Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  reservations   Reservation[]
+}
+
+model Court {
+  id           String        @id @default(cuid())
+  name         String
+  slug         String        @unique
+  type         CourtType
+  description  String
+  sports       String[]
+  active       Boolean       @default(true)
+  reservations Reservation[]
+  blocks       CourtBlock[]
+  permanentBlocks PermanentCourtBlock[]
+  prices       CourtPrice[]
+}
+
+model CourtPrice {
+  id                String   @id @default(cuid())
+  courtId           String
+  sport             String
+  hourlyPriceCents  Int
+  twoHourPromoCents Int?
+  promoActive       Boolean  @default(true)
+  promoDays         String?
+  promoStartMinutes Int?
+  promoEndMinutes   Int?
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  court             Court    @relation(fields: [courtId], references: [id])
+
+  @@unique([courtId, sport])
+  @@index([courtId, active])
+}
+
+model Reservation {
+  id             String            @id @default(cuid())
+  courtId        String
+  userId         String?
+  guestName      String?
+  startAt        DateTime
+  endAt          DateTime
+  durationHours  Int
+  sport          String
+  amountCents    Int
+  status         ReservationStatus @default(PENDING_PAYMENT)
+  expiresAt      DateTime?
+  cancelledAt    DateTime?
+  cancelReason   String?
+  createdByRole  Role              @default(CLIENT)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  court          Court             @relation(fields: [courtId], references: [id])
+  user           User?             @relation(fields: [userId], references: [id])
+  payment        Payment?
+  whatsappLogs   WhatsAppLog[]
+
+  @@index([courtId, startAt, endAt])
+  @@index([status, expiresAt])
+}
+
+model Payment {
+  id                    String        @id @default(cuid())
+  reservationId         String        @unique
+  provider              String
+  providerPaymentId     String?
+  status                PaymentStatus @default(PENDING)
+  amountCents           Int
+  pixQrCode             String?
+  pixQrCodeBase64       String?
+  pixExpiresAt          DateTime?
+  paidAt                DateTime?
+  rawPayload            Json?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  reservation           Reservation   @relation(fields: [reservationId], references: [id])
+}
+
+model CourtBlock {
+  id        String   @id @default(cuid())
+  courtId   String
+  startAt   DateTime
+  endAt     DateTime
+  reason    String
+  createdAt DateTime @default(now())
+  court     Court    @relation(fields: [courtId], references: [id])
+
+  @@index([courtId, startAt, endAt])
+}
+
+model PermanentCourtBlock {
+  id           String   @id @default(cuid())
+  courtId      String
+  dayOfWeek    Int
+  startMinutes Int
+  endMinutes   Int
+  reason       String
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  court        Court    @relation(fields: [courtId], references: [id])
+
+  @@index([courtId, dayOfWeek, active])
+}
+
+model WhatsAppLog {
+  id            String        @id @default(cuid())
+  reservationId String?
+  event         WhatsAppEvent
+  phone         String?
+  message       String
+  redirectUrl   String
+  sentAt        DateTime?
+  createdAt     DateTime      @default(now())
+  reservation   Reservation?  @relation(fields: [reservationId], references: [id])
+}
