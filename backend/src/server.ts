@@ -32,8 +32,7 @@ await app.register(cors, {
       "http://127.0.0.1:5174",
       "http://127.0.0.1:5175"
     ]);
-    const isNetlifyFrontend = /^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin);
-    callback(null, allowedOrigins.has(origin) || isNetlifyFrontend);
+    callback(null, allowedOrigins.has(origin));
   },
   credentials: true
 });
@@ -49,6 +48,21 @@ await app.register(fastifyStatic, {
 app.setErrorHandler((error, request, reply) => {
   request.log.error(error);
   const message = error instanceof Error ? error.message : "Erro interno do servidor.";
+
+  if (message.includes("reservation_no_active_overlap") || (error as { code?: string }).code === "P2002") {
+    return reply.code(409).send({ message: "HorÃ¡rio acabou de ser reservado por outra pessoa. Escolha outro horÃ¡rio." });
+  }
+
+  if (message.includes("court_block_no_overlap") || message.includes("permanent_block_no_overlap")) {
+    return reply.code(409).send({ message: "JÃ¡ existe um bloqueio conflitante para esse horÃ¡rio." });
+  }
+
+  if (
+    message === "A selecao possui horarios repetidos ou conflitantes." ||
+    message === "Existe reserva futura conflitante com esse horario permanente."
+  ) {
+    return reply.code(400).send({ message });
+  }
 
   if (error instanceof ZodError) {
     return reply.code(400).send({

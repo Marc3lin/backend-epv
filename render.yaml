@@ -9,7 +9,11 @@ services:
       - key: NODE_VERSION
         value: 24
       - key: PAYMENTS_MODE
-        value: mock
+        sync: false
+      - key: MERCADO_PAGO_ACCESS_TOKEN
+        sync: false
+      - key: MERCADO_PAGO_PIX_FEE_PERCENT
+        value: 0.99
       - key: FRONTEND_URL
         sync: false
       - key: PUBLIC_BASE_URL

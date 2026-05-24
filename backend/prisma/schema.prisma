@@ -25,6 +25,8 @@ enum ReservationStatus {
   CONFIRMED
   CANCELLED
   EXPIRED
+  FAILED
+  REFUNDED
 }
 
 enum PaymentStatus {
@@ -32,6 +34,7 @@ enum PaymentStatus {
   PAID
   CANCELLED
   REFUNDED_MANUAL
+  REFUNDED
   FAILED
 }
 
@@ -117,7 +120,7 @@ model Payment {
   id                    String        @id @default(cuid())
   reservationId         String        @unique
   provider              String
-  providerPaymentId     String?
+  providerPaymentId     String?       @unique
   status                PaymentStatus @default(PENDING)
   amountCents           Int
   pixQrCode             String?
@@ -128,6 +131,19 @@ model Payment {
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
   reservation           Reservation   @relation(fields: [reservationId], references: [id])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
 }
 
 model CourtBlock {

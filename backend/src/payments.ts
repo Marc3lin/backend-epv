@@ -9,6 +9,12 @@ type MercadoPagoPayment = {
   status: string;
   status_detail?: string;
   transaction_amount?: number;
+  external_reference?: string;
+  date_approved?: string;
+  metadata?: {
+    reservation_id?: string;
+    court_id?: string;
+  };
   point_of_interaction?: {
     transaction_data?: {
       qr_code?: string;

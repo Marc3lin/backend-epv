@@ -52,6 +52,33 @@ function paymentNetCents(payment: { amountCents: number; provider?: string | nul
     : payment.amountCents;
 }
 
+function centsFromMercadoPagoAmount(amount?: number) {
+  if (typeof amount !== "number" || !Number.isFinite(amount)) return null;
+  return Math.round(amount * 100);
+}
+
+function isMercadoPagoProvider(provider?: string | null) {
+  return provider === "mercado_pago";
+}
+
+async function writeAuditLog(input: {
+  actorId?: string | null;
+  action: string;
+  entityType: string;
+  entityId?: string | null;
+  metadata?: Prisma.InputJsonValue;
+}, db: Prisma.TransactionClient | typeof prisma = prisma) {
+  await db.auditLog.create({
+    data: {
+      actorId: input.actorId ?? null,
+      action: input.action,
+      entityType: input.entityType,
+      entityId: input.entityId ?? null,
+      metadata: input.metadata ?? undefined
+    }
+  }).catch(() => undefined);
+}
+
 function getSaoPauloDateTimeParts(date: Date) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Sao_Paulo",
@@ -120,6 +147,18 @@ function ensureReservationDuration(durationMinutes: number) {
   }
 }
 
+function assertNoInternalBatchConflict(items: Array<{ courtId: string; startAt: Date; endAt: Date }>) {
+  for (let index = 0; index < items.length; index++) {
+    for (let nextIndex = index + 1; nextIndex < items.length; nextIndex++) {
+      const current = items[index];
+      const next = items[nextIndex];
+      if (current.courtId === next.courtId && current.startAt < next.endAt && current.endAt > next.startAt) {
+        throw new Error("A selecao possui horarios repetidos ou conflitantes.");
+      }
+    }
+  }
+}
+
 async function assertNoConflict(courtId: string, startAt: Date, endAt: Date, ignoreReservationId?: string, db: Prisma.TransactionClient | typeof prisma = prisma) {
   const activeStatuses = [ReservationStatus.PENDING_PAYMENT, ReservationStatus.CONFIRMED];
   const conflict = await db.reservation.findFirst({
@@ -156,6 +195,24 @@ async function assertNoConflict(courtId: string, startAt: Date, endAt: Date, ign
   if (conflict || block || permanentBlock) throw new Error("Horário indisponível para esta quadra.");
 }
 
+async function assertNoFutureReservationConflictForPermanentBlock(courtId: string, dayOfWeek: number, startMinutes: number, endMinutes: number) {
+  const reservations = await prisma.reservation.findMany({
+    where: {
+      courtId,
+      status: { in: [ReservationStatus.PENDING_PAYMENT, ReservationStatus.CONFIRMED] },
+      endAt: { gt: new Date() }
+    },
+    select: { id: true, startAt: true, endAt: true },
+    take: 1000
+  });
+  const conflict = reservations.find((reservation) => {
+    const start = getSaoPauloDateParts(reservation.startAt);
+    const end = getSaoPauloDateParts(reservation.endAt);
+    return start.dayOfWeek === dayOfWeek && start.minutes < endMinutes && end.minutes > startMinutes;
+  });
+  if (conflict) throw new Error("Existe reserva futura conflitante com esse horario permanente.");
+}
+
 async function expireOldReservations() {
   await prisma.reservation.updateMany({
     where: {
@@ -179,43 +236,98 @@ async function syncMercadoPagoPayment(paymentId: string) {
     include: { reservation: { include: { court: true, user: true } } }
   });
   if (!payment) throw new Error("Pagamento não encontrado.");
-  if (payment.status !== PaymentStatus.PENDING || !payment.providerPaymentId || !payment.provider.includes("mercado_pago")) {
+  if (payment.status !== PaymentStatus.PENDING || !payment.providerPaymentId || !isMercadoPagoProvider(payment.provider)) {
     return payment;
   }
 
   const mercadoPagoPayment = await getMercadoPagoPayment(payment.providerPaymentId);
+  const paidAmountCents = centsFromMercadoPagoAmount(mercadoPagoPayment.transaction_amount);
+  const referenceMatches = mercadoPagoPayment.external_reference === payment.reservationId
+    || mercadoPagoPayment.metadata?.reservation_id === payment.reservationId;
+  const amountMatches = paidAmountCents === payment.amountCents;
+  const approvedAt = mercadoPagoPayment.date_approved ? new Date(mercadoPagoPayment.date_approved) : null;
+  const paidAfterExpiration = Boolean(
+    mercadoPagoPayment.status === "approved"
+    && payment.pixExpiresAt
+    && approvedAt
+    && approvedAt.getTime() > payment.pixExpiresAt.getTime()
+  );
   const nextPaymentStatus = mercadoPagoPayment.status === "approved"
-    ? PaymentStatus.PAID
+    ? (referenceMatches && amountMatches && !paidAfterExpiration ? PaymentStatus.PAID : PaymentStatus.FAILED)
     : mercadoPagoPayment.status === "cancelled"
       ? PaymentStatus.CANCELLED
-      : ["rejected", "refunded", "charged_back"].includes(mercadoPagoPayment.status)
+      : mercadoPagoPayment.status === "refunded"
+        ? PaymentStatus.REFUNDED
+        : ["rejected", "charged_back"].includes(mercadoPagoPayment.status)
         ? PaymentStatus.FAILED
         : PaymentStatus.PENDING;
 
-  const updated = await prisma.payment.update({
-    where: { id: payment.id },
-    data: {
-      status: nextPaymentStatus,
-      paidAt: nextPaymentStatus === PaymentStatus.PAID ? new Date() : payment.paidAt,
-      rawPayload: {
-        ...(payment.rawPayload && typeof payment.rawPayload === "object" && !Array.isArray(payment.rawPayload) ? payment.rawPayload : {}),
-        mercadoPagoPayment
+  const updated = await prisma.$transaction(async (tx) => {
+    const current = await tx.payment.findUnique({
+      where: { id: payment.id },
+      include: { reservation: true }
+    });
+    if (!current || current.status !== PaymentStatus.PENDING) return current ?? payment;
+
+    const nextReservationStatus = nextPaymentStatus === PaymentStatus.PAID
+      ? ReservationStatus.CONFIRMED
+      : nextPaymentStatus === PaymentStatus.REFUNDED
+        ? ReservationStatus.REFUNDED
+        : nextPaymentStatus === PaymentStatus.CANCELLED || nextPaymentStatus === PaymentStatus.FAILED
+          ? ReservationStatus.FAILED
+          : current.reservation.status;
+
+    const updatedPayment = await tx.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: nextPaymentStatus,
+        paidAt: nextPaymentStatus === PaymentStatus.PAID ? (approvedAt ?? new Date()) : current.paidAt,
+        rawPayload: {
+          ...(current.rawPayload && typeof current.rawPayload === "object" && !Array.isArray(current.rawPayload) ? current.rawPayload : {}),
+          mercadoPagoPayment,
+          validation: {
+            referenceMatches,
+            amountMatches,
+            paidAfterExpiration,
+            expectedAmountCents: current.amountCents,
+            paidAmountCents
+          }
+        }
       }
+    });
+
+    if (current.reservation.status === ReservationStatus.PENDING_PAYMENT && nextReservationStatus !== current.reservation.status) {
+      await tx.reservation.update({
+        where: { id: current.reservationId },
+        data: { status: nextReservationStatus }
+      });
     }
+
+    await writeAuditLog({
+      action: "payment.sync",
+      entityType: "Payment",
+      entityId: payment.id,
+      metadata: {
+        provider: "mercado_pago",
+        providerPaymentId: payment.providerPaymentId,
+        nextPaymentStatus,
+        referenceMatches,
+        amountMatches,
+        paidAfterExpiration
+      }
+    }, tx);
+
+    return updatedPayment;
   });
 
-  if (nextPaymentStatus === PaymentStatus.PAID) {
-    const reservation = await prisma.reservation.update({
+  if (updated?.status === PaymentStatus.PAID) {
+    const reservation = await prisma.reservation.findUnique({
       where: { id: payment.reservationId },
-      data: { status: ReservationStatus.CONFIRMED },
       include: { court: true, user: true }
     });
-    await logWhatsApp(WhatsAppEvent.PAYMENT_CONFIRMED, reservation);
-  } else if (nextPaymentStatus === PaymentStatus.CANCELLED || nextPaymentStatus === PaymentStatus.FAILED) {
-    await prisma.reservation.update({
-      where: { id: payment.reservationId },
-      data: { status: ReservationStatus.EXPIRED }
-    });
+    if (reservation?.status === ReservationStatus.CONFIRMED) {
+      await logWhatsApp(WhatsAppEvent.PAYMENT_CONFIRMED, reservation);
+    }
   }
 
   return updated;
@@ -238,6 +350,58 @@ async function syncPendingMercadoPagoPayments() {
       undefined;
     }
   }
+}
+
+async function ensureDatabaseGuards() {
+  await prisma.$executeRawUnsafe(`CREATE EXTENSION IF NOT EXISTS btree_gist`);
+  await prisma.$executeRawUnsafe(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'reservation_no_active_overlap'
+      ) THEN
+        ALTER TABLE "Reservation"
+        ADD CONSTRAINT reservation_no_active_overlap
+        EXCLUDE USING gist (
+          "courtId" WITH =,
+          tsrange("startAt", "endAt", '[)') WITH &&
+        )
+        WHERE (status IN ('PENDING_PAYMENT', 'CONFIRMED'));
+      END IF;
+    END $$;
+  `);
+  await prisma.$executeRawUnsafe(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'court_block_no_overlap'
+      ) THEN
+        ALTER TABLE "CourtBlock"
+        ADD CONSTRAINT court_block_no_overlap
+        EXCLUDE USING gist (
+          "courtId" WITH =,
+          tsrange("startAt", "endAt", '[)') WITH &&
+        );
+      END IF;
+    END $$;
+  `);
+  await prisma.$executeRawUnsafe(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'permanent_block_no_overlap'
+      ) THEN
+        ALTER TABLE "PermanentCourtBlock"
+        ADD CONSTRAINT permanent_block_no_overlap
+        EXCLUDE USING gist (
+          "courtId" WITH =,
+          "dayOfWeek" WITH =,
+          int4range("startMinutes", "endMinutes", '[)') WITH &&
+        )
+        WHERE (active = true);
+      END IF;
+    END $$;
+  `);
 }
 
 function promoMatches(price: {
@@ -326,6 +490,7 @@ function findSavedPrice(court: { id: string; type: string }, sport: string, pric
 }
 
 export async function registerRoutes(app: FastifyInstance) {
+  await ensureDatabaseGuards();
   const paymentSyncTimer = setInterval(() => {
     void syncPendingMercadoPagoPayments();
   }, 60_000);
@@ -608,6 +773,15 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
     const created: { reservation: any; payment: any; whatsapp: any }[] = [];
+    assertNoInternalBatchConflict(body.items.map((item) => {
+      const startAt = new Date(item.startAt);
+      const durationMinutes = item.durationMinutes ?? (item.durationHours ?? 1) * 60;
+      return {
+        courtId: item.courtId,
+        startAt,
+        endAt: addMinutes(startAt, durationMinutes)
+      };
+    }));
 
     for (const item of body.items) {
       const startAt = new Date(item.startAt);
@@ -773,10 +947,13 @@ export async function registerRoutes(app: FastifyInstance) {
     return reply.code(201).send(reservation);
   });
 
-  app.post("/api/admin/reservations/:id/payment", { preHandler: requireRole([Role.ADMIN, Role.RECEPTION]) }, async (request, reply) => {
+  app.post("/api/admin/reservations/:id/payment", { preHandler: requireRole([Role.ADMIN]) }, async (request, reply) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const body = z.object({ status: z.nativeEnum(PaymentStatus) }).parse(request.body);
     const existingPayment = await prisma.payment.findUnique({ where: { reservationId: id } });
+    if (existingPayment && body.status === PaymentStatus.PAID && isMercadoPagoProvider(existingPayment.provider)) {
+      return reply.code(400).send({ message: "Pagamentos Mercado Pago so podem ser confirmados por consulta segura ao provedor." });
+    }
     if (!existingPayment) return reply.code(404).send({ message: "Pagamento não encontrado para esta reserva." });
 
     const payment = await prisma.payment.update({
@@ -787,6 +964,13 @@ export async function registerRoutes(app: FastifyInstance) {
       where: { id },
       data: { status: body.status === PaymentStatus.PAID ? ReservationStatus.CONFIRMED : ReservationStatus.PENDING_PAYMENT },
       include: { court: true, user: true }
+    });
+    await writeAuditLog({
+      actorId: request.user.id,
+      action: "admin.payment.update",
+      entityType: "Reservation",
+      entityId: id,
+      metadata: { status: body.status }
     });
     if (body.status === PaymentStatus.PAID) await logWhatsApp(WhatsAppEvent.PAYMENT_CONFIRMED, reservation);
     return { reservation, payment };
@@ -976,7 +1160,7 @@ export async function registerRoutes(app: FastifyInstance) {
     });
   });
 
-  app.get("/api/admin/financial", { preHandler: requireRole([Role.ADMIN, Role.RECEPTION]) }, async () => {
+  app.get("/api/admin/financial", { preHandler: requireRole([Role.ADMIN]) }, async () => {
     const ranges = [1, 7, 14, 30, 60, 90];
     const now = Date.now();
     const results = await Promise.all(ranges.map(async (days) => {
@@ -1144,8 +1328,8 @@ export async function registerRoutes(app: FastifyInstance) {
       permanentBlocks,
       summary: {
         reservations: activeReservations.length,
-        estimatedRevenueCents: activeReservations.reduce((total, item) => total + reservationNetCents(item), 0),
-        confirmedRevenueCents: confirmedReservations.reduce((total, item) => total + reservationNetCents(item), 0),
+        estimatedRevenueCents: request.user.role === Role.ADMIN ? activeReservations.reduce((total, item) => total + reservationNetCents(item), 0) : 0,
+        confirmedRevenueCents: request.user.role === Role.ADMIN ? confirmedReservations.reduce((total, item) => total + reservationNetCents(item), 0) : 0,
         permanentBlocks: permanentBlocks.length
       }
     };
@@ -1174,6 +1358,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
     const created = [];
     for (const dayOfWeek of body.daysOfWeek) {
+      await assertNoFutureReservationConflictForPermanentBlock(body.courtId, dayOfWeek, startMinutes, endMinutes);
       const conflict = await prisma.permanentCourtBlock.findFirst({
         where: {
           courtId: body.courtId,
@@ -1246,44 +1431,17 @@ export async function registerRoutes(app: FastifyInstance) {
     });
     if (!payment) return reply.code(200).send({ ok: true });
 
-    const mercadoPagoPayment = await getMercadoPagoPayment(String(providerPaymentId));
-    const nextPaymentStatus = mercadoPagoPayment.status === "approved"
-      ? PaymentStatus.PAID
-      : mercadoPagoPayment.status === "cancelled"
-        ? PaymentStatus.CANCELLED
-        : ["rejected", "refunded", "charged_back"].includes(mercadoPagoPayment.status)
-          ? PaymentStatus.FAILED
-          : PaymentStatus.PENDING;
-
-    await prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: nextPaymentStatus,
-        paidAt: nextPaymentStatus === PaymentStatus.PAID ? new Date() : null,
-        rawPayload: {
-          notification: body,
-          query,
-          mercadoPagoPayment
-        }
+    await writeAuditLog({
+      action: "payment.webhook.received",
+      entityType: "Payment",
+      entityId: payment.id,
+      metadata: {
+        provider: "mercado_pago",
+        providerPaymentId: String(providerPaymentId),
+        type: body?.type ?? query?.type ?? query?.topic ?? null
       }
     });
-
-    if (nextPaymentStatus !== PaymentStatus.PAID) {
-      if (nextPaymentStatus === PaymentStatus.CANCELLED || nextPaymentStatus === PaymentStatus.FAILED) {
-        await prisma.reservation.update({
-          where: { id: payment.reservationId },
-          data: { status: ReservationStatus.EXPIRED }
-        });
-      }
-      return { ok: true };
-    }
-
-    const reservation = await prisma.reservation.update({
-      where: { id: payment.reservationId },
-      data: { status: ReservationStatus.CONFIRMED },
-      include: { court: true, user: true }
-    });
-    await logWhatsApp(WhatsAppEvent.PAYMENT_CONFIRMED, reservation);
+    await syncMercadoPagoPayment(payment.id);
     return { ok: true };
   });
 }
